@@ -247,21 +247,66 @@ function ecg(p) {
   return g(.18, .12, .025) + g(.36, -.12, .008) + g(.39, 1, .010) + g(.42, -.25, .010) + g(.66, .28, .045);
 }
 
-function run(draw) {
+// Render scale. Styles draw in 1920x1080 units, but inside the pitch page the frame is shown
+// much smaller, so the canvas backing store is sized to what is actually on screen.
+let K = 1;
+
+// shadowBlur ignores the canvas transform, so scale it by hand to keep the glow the same size
+function scaled(ctx) {
+  const d = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, &#x27;shadowBlur&#x27;);
+  Object.defineProperty(ctx, &#x27;shadowBlur&#x27;, {
+    configurable: true,
+    get() { return d.get.call(this) / K; },
+    set(v) { d.set.call(this, v * K); },
+  });
+  return ctx;
+}
+
+function fitCanvas(c, ctx) {
+  let shown = 1920;
+  try {
+    const r = window.frameElement &amp;&amp; window.frameElement.getBoundingClientRect();
+    if (r &amp;&amp; r.width) shown = Math.max(r.width, r.height);
+  } catch (e) {}
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const k = Math.min(1, Math.max(0.2, Math.ceil(shown * dpr / 1920 * 10) / 10));
+  if (k !== K || c.width !== Math.round(1920 * k)) {
+    K = k;
+    c.width = Math.round(1920 * k); c.height = Math.round(1080 * k);
+    c.style.width = &#x27;1920px&#x27;; c.style.height = &#x27;1080px&#x27;;
+  }
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+}
+
+function run(draw, canvas) {
+  const ctx = canvas ? canvas.getContext(&#x27;2d&#x27;) : null;
   const go = () =&gt; {
-    if (T0 !== null) { draw(T0); document.body.dataset.ready = 1; return; }
-    // inside the pitch page each style is an iframe; skip drawing while it is scrolled off-screen
-    let visible = true;
+    if (T0 !== null) { if (ctx) fitCanvas(canvas, ctx); draw(T0); document.body.dataset.ready = 1; return; }
+    // In the pitch page: skip frames while scrolled off-screen, hold a still frame when the page
+    // says this style shouldn&#x27;t play (window.__play === false), and run at 30 fps on small screens.
+    let visible = true, drawn = false, last = 0;
     if (&#x27;IntersectionObserver&#x27; in window) new IntersectionObserver(es =&gt; { visible = es[0].isIntersecting; }).observe(document.body);
+    const still = window.matchMedia &amp;&amp; matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+    const touch = window.matchMedia &amp;&amp; matchMedia(&#x27;(pointer: coarse)&#x27;).matches;
     const s = performance.now();
-    const f = n =&gt; { if (visible) draw((n - s) / 1000); requestAnimationFrame(f); };
+    const f = n =&gt; {
+      requestAnimationFrame(f);
+      if (!visible) return;
+      const play = window.__play !== false &amp;&amp; !still;
+      if (!play &amp;&amp; drawn) return;
+      if (play &amp;&amp; (touch || K &lt; 0.5) &amp;&amp; n - last &lt; 31) return;
+      last = n;
+      if (ctx) fitCanvas(canvas, ctx);
+      draw((n - s) / 1000);
+      drawn = true;
+    };
     requestAnimationFrame(f);
   };
   document.fonts ? document.fonts.ready.then(go) : go();
 }
 &lt;/script&gt;
 &lt;script&gt;
-const c = document.getElementById(&#x27;c&#x27;), x = c.getContext(&#x27;2d&#x27;);
+const c = document.getElementById(&#x27;c&#x27;), x = scaled(c.getContext(&#x27;2d&#x27;));
 const bpmEl = document.getElementById(&#x27;bpm&#x27;);
 
 function draw(t) {
@@ -326,21 +371,25 @@ function draw(t) {
 
   // live ECG sweep
   const y0 = 860, A = 105, speed = 330, W = 1920, head = (t * speed) % W;
-  x.lineWidth = 3; x.strokeStyle = &#x27;#3FF2D2&#x27;; x.shadowColor = &#x27;#3FF2D2&#x27;; x.shadowBlur = 14;
+  x.lineWidth = 3; x.lineCap = &#x27;round&#x27;; x.strokeStyle = &#x27;#3FF2D2&#x27;; x.shadowColor = &#x27;#3FF2D2&#x27;; x.shadowBlur = 14;
+  // the fading trail is grouped into 16 brightness steps, one glowing stroke each
+  const steps = 16, trail = Array.from({ length: steps }, () =&gt; new Path2D());
   let prev = null;
   for (let px = 0; px &lt; W; px += 3) {
     const age = px &lt;= head ? (head - px) / speed : (head + W - px) / speed;
     if (px &gt; head &amp;&amp; px &lt; head + 50) { prev = null; continue; }
     const tt = t - age, p = (((tt % per) + per) % per) / per, yy = y0 - ecg(p) * A;
-    if (prev) { x.globalAlpha = Math.max(0, 1 - age / 5.2); x.beginPath(); x.moveTo(prev[0], prev[1]); x.lineTo(px, yy); x.stroke(); }
+    const al = 1 - age / 5.2;
+    if (prev &amp;&amp; al &gt; 0) { const s = trail[Math.min(steps - 1, Math.floor(al * steps))]; s.moveTo(prev[0], prev[1]); s.lineTo(px, yy); }
     prev = [px, yy];
   }
-  x.globalAlpha = 1;
+  trail.forEach((s, i) =&gt; { x.globalAlpha = (i + 0.5) / steps; x.stroke(s); });
+  x.globalAlpha = 1; x.lineCap = &#x27;butt&#x27;;
   const hy = y0 - ecg(ph) * A;
   x.fillStyle = &#x27;#EFFFFB&#x27;; x.shadowBlur = 30; x.beginPath(); x.arc(head, hy, 6, 0, 7); x.fill();
   x.shadowBlur = 0;
 }
-run(draw);
+run(draw, c);
 &lt;/script&gt;
 &lt;/body&gt;
 &lt;/html&gt;
@@ -418,21 +467,66 @@ function ecg(p) {
   return g(.18, .12, .025) + g(.36, -.12, .008) + g(.39, 1, .010) + g(.42, -.25, .010) + g(.66, .28, .045);
 }
 
-function run(draw) {
+// Render scale. Styles draw in 1920x1080 units, but inside the pitch page the frame is shown
+// much smaller, so the canvas backing store is sized to what is actually on screen.
+let K = 1;
+
+// shadowBlur ignores the canvas transform, so scale it by hand to keep the glow the same size
+function scaled(ctx) {
+  const d = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, &#x27;shadowBlur&#x27;);
+  Object.defineProperty(ctx, &#x27;shadowBlur&#x27;, {
+    configurable: true,
+    get() { return d.get.call(this) / K; },
+    set(v) { d.set.call(this, v * K); },
+  });
+  return ctx;
+}
+
+function fitCanvas(c, ctx) {
+  let shown = 1920;
+  try {
+    const r = window.frameElement &amp;&amp; window.frameElement.getBoundingClientRect();
+    if (r &amp;&amp; r.width) shown = Math.max(r.width, r.height);
+  } catch (e) {}
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const k = Math.min(1, Math.max(0.2, Math.ceil(shown * dpr / 1920 * 10) / 10));
+  if (k !== K || c.width !== Math.round(1920 * k)) {
+    K = k;
+    c.width = Math.round(1920 * k); c.height = Math.round(1080 * k);
+    c.style.width = &#x27;1920px&#x27;; c.style.height = &#x27;1080px&#x27;;
+  }
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+}
+
+function run(draw, canvas) {
+  const ctx = canvas ? canvas.getContext(&#x27;2d&#x27;) : null;
   const go = () =&gt; {
-    if (T0 !== null) { draw(T0); document.body.dataset.ready = 1; return; }
-    // inside the pitch page each style is an iframe; skip drawing while it is scrolled off-screen
-    let visible = true;
+    if (T0 !== null) { if (ctx) fitCanvas(canvas, ctx); draw(T0); document.body.dataset.ready = 1; return; }
+    // In the pitch page: skip frames while scrolled off-screen, hold a still frame when the page
+    // says this style shouldn&#x27;t play (window.__play === false), and run at 30 fps on small screens.
+    let visible = true, drawn = false, last = 0;
     if (&#x27;IntersectionObserver&#x27; in window) new IntersectionObserver(es =&gt; { visible = es[0].isIntersecting; }).observe(document.body);
+    const still = window.matchMedia &amp;&amp; matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+    const touch = window.matchMedia &amp;&amp; matchMedia(&#x27;(pointer: coarse)&#x27;).matches;
     const s = performance.now();
-    const f = n =&gt; { if (visible) draw((n - s) / 1000); requestAnimationFrame(f); };
+    const f = n =&gt; {
+      requestAnimationFrame(f);
+      if (!visible) return;
+      const play = window.__play !== false &amp;&amp; !still;
+      if (!play &amp;&amp; drawn) return;
+      if (play &amp;&amp; (touch || K &lt; 0.5) &amp;&amp; n - last &lt; 31) return;
+      last = n;
+      if (ctx) fitCanvas(canvas, ctx);
+      draw((n - s) / 1000);
+      drawn = true;
+    };
     requestAnimationFrame(f);
   };
   document.fonts ? document.fonts.ready.then(go) : go();
 }
 &lt;/script&gt;
 &lt;script&gt;
-const c = document.getElementById(&#x27;c&#x27;), x = c.getContext(&#x27;2d&#x27;);
+const c = document.getElementById(&#x27;c&#x27;), x = scaled(c.getContext(&#x27;2d&#x27;));
 const bw = document.getElementById(&#x27;bw&#x27;), bs = document.getElementById(&#x27;bs&#x27;);
 
 function draw(t) {
@@ -488,7 +582,7 @@ function draw(t) {
     x.fillStyle = &#x27;#E8766A&#x27;; x.beginPath(); x.arc(e[0], e[1], 9, 0, 7); x.fill();
   }
 }
-run(draw);
+run(draw, c);
 &lt;/script&gt;
 &lt;/body&gt;
 &lt;/html&gt;
@@ -524,15 +618,12 @@ run(draw);
 &lt;/head&gt;
 &lt;body&gt;
 &lt;svg width=&quot;1920&quot; height=&quot;1080&quot; viewBox=&quot;0 0 1920 1080&quot;&gt;
-  &lt;defs&gt;
-    &lt;filter id=&quot;grain&quot;&gt;&lt;feTurbulence type=&quot;fractalNoise&quot; baseFrequency=&quot;0.85&quot; numOctaves=&quot;2&quot; seed=&quot;4&quot;/&gt;&lt;feColorMatrix values=&quot;0 0 0 0 0.3  0 0 0 0 0.27  0 0 0 0 0.22  0 0 0 0.09 0&quot;/&gt;&lt;/filter&gt;
-  &lt;/defs&gt;
   &lt;path id=&quot;fill&quot; fill=&quot;#E0533B&quot; fill-opacity=&quot;0.07&quot;/&gt;
   &lt;path id=&quot;line&quot; fill=&quot;none&quot; stroke=&quot;#1E1E1E&quot; stroke-width=&quot;4&quot; stroke-linecap=&quot;round&quot; stroke-linejoin=&quot;round&quot;/&gt;
   &lt;circle id=&quot;halo&quot; r=&quot;22&quot; fill=&quot;#E0533B&quot; fill-opacity=&quot;0.18&quot;/&gt;
   &lt;circle id=&quot;dot&quot; r=&quot;9&quot; fill=&quot;#E0533B&quot;/&gt;
-  &lt;rect width=&quot;1920&quot; height=&quot;1080&quot; filter=&quot;url(#grain)&quot;/&gt;
 &lt;/svg&gt;
+&lt;canvas id=&quot;grain&quot; width=&quot;960&quot; height=&quot;540&quot; style=&quot;position:absolute; inset:0; width:1920px; height:1080px; pointer-events:none&quot;&gt;&lt;/canvas&gt;
 &lt;div class=&quot;ui&quot;&gt;
   &lt;div class=&quot;rule&quot;&gt;&lt;/div&gt;
   &lt;div class=&quot;folio&quot;&gt;02 / 07 · קצב הלב&lt;/div&gt;
@@ -577,20 +668,76 @@ function ecg(p) {
   return g(.18, .12, .025) + g(.36, -.12, .008) + g(.39, 1, .010) + g(.42, -.25, .010) + g(.66, .28, .045);
 }
 
-function run(draw) {
+// Render scale. Styles draw in 1920x1080 units, but inside the pitch page the frame is shown
+// much smaller, so the canvas backing store is sized to what is actually on screen.
+let K = 1;
+
+// shadowBlur ignores the canvas transform, so scale it by hand to keep the glow the same size
+function scaled(ctx) {
+  const d = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, &#x27;shadowBlur&#x27;);
+  Object.defineProperty(ctx, &#x27;shadowBlur&#x27;, {
+    configurable: true,
+    get() { return d.get.call(this) / K; },
+    set(v) { d.set.call(this, v * K); },
+  });
+  return ctx;
+}
+
+function fitCanvas(c, ctx) {
+  let shown = 1920;
+  try {
+    const r = window.frameElement &amp;&amp; window.frameElement.getBoundingClientRect();
+    if (r &amp;&amp; r.width) shown = Math.max(r.width, r.height);
+  } catch (e) {}
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const k = Math.min(1, Math.max(0.2, Math.ceil(shown * dpr / 1920 * 10) / 10));
+  if (k !== K || c.width !== Math.round(1920 * k)) {
+    K = k;
+    c.width = Math.round(1920 * k); c.height = Math.round(1080 * k);
+    c.style.width = &#x27;1920px&#x27;; c.style.height = &#x27;1080px&#x27;;
+  }
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+}
+
+function run(draw, canvas) {
+  const ctx = canvas ? canvas.getContext(&#x27;2d&#x27;) : null;
   const go = () =&gt; {
-    if (T0 !== null) { draw(T0); document.body.dataset.ready = 1; return; }
-    // inside the pitch page each style is an iframe; skip drawing while it is scrolled off-screen
-    let visible = true;
+    if (T0 !== null) { if (ctx) fitCanvas(canvas, ctx); draw(T0); document.body.dataset.ready = 1; return; }
+    // In the pitch page: skip frames while scrolled off-screen, hold a still frame when the page
+    // says this style shouldn&#x27;t play (window.__play === false), and run at 30 fps on small screens.
+    let visible = true, drawn = false, last = 0;
     if (&#x27;IntersectionObserver&#x27; in window) new IntersectionObserver(es =&gt; { visible = es[0].isIntersecting; }).observe(document.body);
+    const still = window.matchMedia &amp;&amp; matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+    const touch = window.matchMedia &amp;&amp; matchMedia(&#x27;(pointer: coarse)&#x27;).matches;
     const s = performance.now();
-    const f = n =&gt; { if (visible) draw((n - s) / 1000); requestAnimationFrame(f); };
+    const f = n =&gt; {
+      requestAnimationFrame(f);
+      if (!visible) return;
+      const play = window.__play !== false &amp;&amp; !still;
+      if (!play &amp;&amp; drawn) return;
+      if (play &amp;&amp; (touch || K &lt; 0.5) &amp;&amp; n - last &lt; 31) return;
+      last = n;
+      if (ctx) fitCanvas(canvas, ctx);
+      draw((n - s) / 1000);
+      drawn = true;
+    };
     requestAnimationFrame(f);
   };
   document.fonts ? document.fonts.ready.then(go) : go();
 }
 &lt;/script&gt;
 &lt;script&gt;
+// paper grain, generated once (an SVG noise filter here was re-rendered on every frame)
+(() =&gt; {
+  const g = document.getElementById(&#x27;grain&#x27;), gx = g.getContext(&#x27;2d&#x27;);
+  const img = gx.createImageData(g.width, g.height), rnd = mulberry32(4);
+  for (let i = 0; i &lt; img.data.length; i += 4) {
+    img.data[i] = 77; img.data[i + 1] = 69; img.data[i + 2] = 56;
+    img.data[i + 3] = rnd() * 30;
+  }
+  gx.putImageData(img, 0, 0);
+})();
+
 const base = 600, s = 12, hcx = 960, hcy = base - 17 * s;
 function seg(xs, xe, per, amp, off = 0) {
   let d = &#x27;&#x27;;
@@ -697,21 +844,66 @@ function ecg(p) {
   return g(.18, .12, .025) + g(.36, -.12, .008) + g(.39, 1, .010) + g(.42, -.25, .010) + g(.66, .28, .045);
 }
 
-function run(draw) {
+// Render scale. Styles draw in 1920x1080 units, but inside the pitch page the frame is shown
+// much smaller, so the canvas backing store is sized to what is actually on screen.
+let K = 1;
+
+// shadowBlur ignores the canvas transform, so scale it by hand to keep the glow the same size
+function scaled(ctx) {
+  const d = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, &#x27;shadowBlur&#x27;);
+  Object.defineProperty(ctx, &#x27;shadowBlur&#x27;, {
+    configurable: true,
+    get() { return d.get.call(this) / K; },
+    set(v) { d.set.call(this, v * K); },
+  });
+  return ctx;
+}
+
+function fitCanvas(c, ctx) {
+  let shown = 1920;
+  try {
+    const r = window.frameElement &amp;&amp; window.frameElement.getBoundingClientRect();
+    if (r &amp;&amp; r.width) shown = Math.max(r.width, r.height);
+  } catch (e) {}
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const k = Math.min(1, Math.max(0.2, Math.ceil(shown * dpr / 1920 * 10) / 10));
+  if (k !== K || c.width !== Math.round(1920 * k)) {
+    K = k;
+    c.width = Math.round(1920 * k); c.height = Math.round(1080 * k);
+    c.style.width = &#x27;1920px&#x27;; c.style.height = &#x27;1080px&#x27;;
+  }
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+}
+
+function run(draw, canvas) {
+  const ctx = canvas ? canvas.getContext(&#x27;2d&#x27;) : null;
   const go = () =&gt; {
-    if (T0 !== null) { draw(T0); document.body.dataset.ready = 1; return; }
-    // inside the pitch page each style is an iframe; skip drawing while it is scrolled off-screen
-    let visible = true;
+    if (T0 !== null) { if (ctx) fitCanvas(canvas, ctx); draw(T0); document.body.dataset.ready = 1; return; }
+    // In the pitch page: skip frames while scrolled off-screen, hold a still frame when the page
+    // says this style shouldn&#x27;t play (window.__play === false), and run at 30 fps on small screens.
+    let visible = true, drawn = false, last = 0;
     if (&#x27;IntersectionObserver&#x27; in window) new IntersectionObserver(es =&gt; { visible = es[0].isIntersecting; }).observe(document.body);
+    const still = window.matchMedia &amp;&amp; matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+    const touch = window.matchMedia &amp;&amp; matchMedia(&#x27;(pointer: coarse)&#x27;).matches;
     const s = performance.now();
-    const f = n =&gt; { if (visible) draw((n - s) / 1000); requestAnimationFrame(f); };
+    const f = n =&gt; {
+      requestAnimationFrame(f);
+      if (!visible) return;
+      const play = window.__play !== false &amp;&amp; !still;
+      if (!play &amp;&amp; drawn) return;
+      if (play &amp;&amp; (touch || K &lt; 0.5) &amp;&amp; n - last &lt; 31) return;
+      last = n;
+      if (ctx) fitCanvas(canvas, ctx);
+      draw((n - s) / 1000);
+      drawn = true;
+    };
     requestAnimationFrame(f);
   };
   document.fonts ? document.fonts.ready.then(go) : go();
 }
 &lt;/script&gt;
 &lt;script&gt;
-const c = document.getElementById(&#x27;c&#x27;), x = c.getContext(&#x27;2d&#x27;);
+const c = document.getElementById(&#x27;c&#x27;), x = scaled(c.getContext(&#x27;2d&#x27;));
 const rnd = mulberry32(7);
 const head = new Path2D(); head.ellipse(960, 330, 128, 162, 0, 0, Math.PI * 2);
 const torso = new Path2D();
@@ -738,6 +930,31 @@ for (let i = 0; i &lt; 1400; i++) {
   P.push({ x: px + j, y: py + j, s: 1 + rnd() * 1.4, a: 0.45 + rnd() * 0.4, ph: rnd() * 6.28 });
 }
 const hcx = 1012, hcy = 735, heart = heartPath(hcx, hcy, 5.6);
+for (const p of P) {
+  const dx = p.x - hcx, dy = p.y - hcy, d = Math.hypot(dx, dy) || 1;
+  const u = Math.min(1, Math.max(0, (p.y - 140) / 940));
+  Object.assign(p, { d, nx: dx / d, ny: dy / d, r: (86 + 56 * u) | 0, g: (224 - 100 * u) | 0 });
+}
+let heartCanvas = null, heartK = 0;
+function heartSprite() {
+  if (heartCanvas &amp;&amp; heartK === K) return heartCanvas;
+  heartCanvas = document.createElement(&#x27;canvas&#x27;);
+  heartCanvas.width = Math.ceil(240 * K); heartCanvas.height = Math.ceil(260 * K); heartK = K;
+  const b = heartCanvas.getContext(&#x27;2d&#x27;);
+  b.setTransform(K, 0, 0, K, (120 - hcx) * K, (130 - hcy) * K); b.globalCompositeOperation = &#x27;lighter&#x27;;
+  for (const p of H) { b.fillStyle = `rgba(255,105,140,${Math.min(1, p.a * 0.85)})`; b.fillRect(p.x, p.y, p.s, p.s); }
+  return heartCanvas;
+}
+let fieldCanvas = null, fieldK = 0;
+function field() {
+  if (fieldCanvas &amp;&amp; fieldK === K) return fieldCanvas;
+  fieldCanvas = document.createElement(&#x27;canvas&#x27;);
+  fieldCanvas.width = c.width; fieldCanvas.height = c.height; fieldK = K;
+  const b = fieldCanvas.getContext(&#x27;2d&#x27;);
+  b.setTransform(K, 0, 0, K, 0, 0); b.globalCompositeOperation = &#x27;lighter&#x27;;
+  for (const p of P) { b.fillStyle = `rgba(${p.r},${p.g},255,${p.a * 0.6})`; b.fillRect(p.x, p.y, p.s, p.s); }
+  return fieldCanvas;
+}
 const H = [];
 for (let n = 0; H.length &lt; 1300 &amp;&amp; n &lt; 50000; n++) {
   const px = hcx - 100 + rnd() * 200, py = hcy - 110 + rnd() * 220;
@@ -761,19 +978,30 @@ function draw(t) {
   x.fillStyle = glow; x.fillRect(hcx - 300, hcy - 300, 600, 600);
 
   x.globalCompositeOperation = &#x27;lighter&#x27;;
-  for (const p of P) {
-    const dx = p.x - hcx, dy = p.y - hcy, d = Math.hypot(dx, dy) || 1;
-    const w = Math.exp(-(((d - rw) / 50) ** 2)) * (1 - ph);
-    const u = Math.min(1, Math.max(0, (p.y - 140) / 940));
-    const r = 86 + 56 * u, g = 224 - 100 * u;
-    x.fillStyle = `rgba(${r | 0},${g | 0},255,${Math.min(1, p.a * (0.6 + w * 1.6))})`;
-    x.fillRect(p.x + dx / d * w * 8, p.y + dy / d * w * 8 + Math.sin(t * 0.7 + p.ph) * 1.4, p.s, p.s);
-  }
-  for (const p of H) {
-    x.fillStyle = `rgba(255,${(90 + beat * 60) | 0},${(130 + beat * 30) | 0},${Math.min(1, p.a * (0.7 + beat * 0.8))})`;
-    const k = 1 + beat * 0.06;
-    x.fillRect(hcx + (p.x - hcx) * k, hcy + (p.y - hcy) * k, p.s, p.s);
-  }
+  // the particle field is drawn once into its own canvas; the heartbeat wave is that same field
+  // added again inside a ring that travels out from the heart, pushed slightly outward
+  const fld = field(), fade = 1 - ph;
+  x.globalAlpha = 0.92 + 0.08 * Math.sin(t * 0.8);
+  x.drawImage(fld, 0, 0, 1920, 1080);
+  if (fade &gt; 0.03) [[110, 0.45], [45, 0.9]].forEach(([band, a]) =&gt; {
+    x.save();
+    x.beginPath();
+    x.arc(hcx, hcy, rw + band, 0, Math.PI * 2);
+    x.arc(hcx, hcy, Math.max(0, rw - band), 0, Math.PI * 2, true);
+    x.clip();
+    x.globalAlpha = a * fade;
+    const z = 1 + 0.008 * fade;
+    x.translate(hcx, hcy); x.scale(z, z); x.translate(-hcx, -hcy);
+    x.drawImage(fld, 0, 0, 1920, 1080);
+    x.restore();
+  });
+  x.globalAlpha = 1;
+  // heart particles: one pre-drawn sprite, scaled with the beat and drawn twice on the pulse
+  const hk = 1 + beat * 0.06, hs = heartSprite();
+  x.drawImage(hs, hcx - 120 * hk, hcy - 130 * hk, 240 * hk, 260 * hk);
+  x.globalAlpha = Math.min(1, beat * 0.9);
+  x.drawImage(hs, hcx - 120 * hk, hcy - 130 * hk, 240 * hk, 260 * hk);
+  x.globalAlpha = 1;
   x.globalCompositeOperation = &#x27;source-over&#x27;;
 
   // orbit around the head
@@ -803,7 +1031,7 @@ function draw(t) {
   vg.addColorStop(0, &#x27;rgba(0,0,0,0)&#x27;); vg.addColorStop(1, &#x27;rgba(0,0,0,.65)&#x27;);
   x.fillStyle = vg; x.fillRect(0, 0, 1920, 1080);
 }
-run(draw);
+run(draw, c);
 &lt;/script&gt;
 &lt;/body&gt;
 &lt;/html&gt;
@@ -858,6 +1086,30 @@ run(draw);
   }
   document.getElementById('hero-ecg').setAttribute('d', d);
 
+  // Which styles animate: an enlarged frame plays alone; on a phone only the frame nearest the
+  // middle of the screen plays and the others hold a still frame; on wider screens all of them play.
+  const ifrs = [...document.querySelectorAll('.frame iframe')];
+  function pick() {
+    const zoomed = document.querySelector('.frame.zoom iframe');
+    const narrow = innerWidth <= 760;
+    let best = null, bestD = Infinity;
+    if (narrow && !zoomed) ifrs.forEach(i => {
+      const r = i.parentElement.getBoundingClientRect();
+      if (r.bottom < 0 || r.top > innerHeight) return;
+      const d = Math.abs((r.top + r.bottom) / 2 - innerHeight / 2);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    ifrs.forEach(i => {
+      const play = zoomed ? i === zoomed : (!narrow || i === best);
+      try { i.contentWindow.__play = play; } catch (e) {}
+    });
+  }
+  let queued = false;
+  addEventListener('scroll', () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; pick(); }); } }, { passive: true });
+  addEventListener('resize', pick);
+  ifrs.forEach(i => i.addEventListener('load', pick));
+  pick();
+
   // fit the 1920x1080 style frames into their boxes; tap a frame to enlarge it
   const back = document.createElement('div');
   back.className = 'zoom-back'; back.hidden = true;
@@ -877,6 +1129,7 @@ run(draw);
       document.documentElement.style.overflow = on ? 'hidden' : '';
       back.hidden = !on;
       fit();
+      pick();
     };
     f.addEventListener('click', toggle);
     f.addEventListener('keydown', e => {
